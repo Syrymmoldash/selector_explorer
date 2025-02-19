@@ -29,7 +29,7 @@ def resource_path(relative_path):
 
 def find_element(selector):
     result = find_elements(selector)
-    if result[0]:
+    if result:
         return UIAWrapper(result[0])
     return None
 
@@ -61,7 +61,7 @@ def find_matches(parent, selector, level=0):
             if value == "" or value == 0 or value == {} or value == []:
                 value = None
             return value
-        elif param == "name":
+        elif param == "title":
             value = child.name
             if value == "" or value == 0 or value == {} or value == []:
                 value = None
@@ -117,10 +117,19 @@ def find_matches(parent, selector, level=0):
 
 
 def find_elements(selector):
+    if not selector or not isinstance(selector[0], dict):
+        print("Invalid selector:", selector)
+        return []
     desktop = UIAElementInfo()
-    window = desktop.children(title=selector[0]["name"])
+    search_args = {k: v for k, v in selector[0].items() if v and (k == "title" or k == "class_name")}
+    window = desktop.children(**search_args)
+    if not window:
+        return []
     matching_elements = []
-    matching_elements.extend(find_matches(window[0], selector[1:]))
+    try:
+        matching_elements.extend(find_matches(window[0], selector[1:]))
+    except Exception as e:
+        return []
     return matching_elements
 
 
@@ -241,7 +250,7 @@ class HighlightWindow(QWidget):
         """Extracts all available properties of a UIA element into a dictionary."""
         properties = {
             "class_name": element.class_name,
-            "name": element.name,
+            "title": element.name,
             "control_type": element.control_type,
             "rich_text": element.rich_text,
             "visible": element.visible,
@@ -455,14 +464,14 @@ class SelectorExplorer(QMainWindow):
         item_map = {}  # Stores elements by their index for parent-child linking
 
         for level, element in enumerate(selector):
-            name = element.get('name', 'Unnamed')
+            title = element.get('title', 'Unnamed')
             class_name = element.get('class_name', '')
             ctrl_index = element.get('ctrl_index', None)
             backend = element.get('backend', '')
             element["level"] = level
 
             # Format tree display
-            tree_text = f"Level {level}, Name: {name}, class_name: {class_name}"
+            tree_text = f"Level {level}, Title: {title}, class_name: {class_name}"
             if backend:
                 tree_text += f", backend: {backend}"
             if ctrl_index is not None:
@@ -484,9 +493,9 @@ class SelectorExplorer(QMainWindow):
             # Store the item in the map
             item_map[level] = item
             if level == 0:
-                self.checkboxes[level] = ["name", "backend", "class_name"]
+                self.checkboxes[level] = ["title", "backend", "class_name"]
             else:
-                self.checkboxes[level] = ["name", "ctrl_index", "class_name"]
+                self.checkboxes[level] = ["title", "ctrl_index", "class_name"]
 
         # Expand all nodes initially
         self.tree.expandAll()
@@ -547,11 +556,18 @@ class SelectorExplorer(QMainWindow):
             return
 
         self.properties_table.clearContents()
-        self.properties_table.setRowCount(len(self.selected_element) - 1)
+        row_counts = len(self.selected_element) - 1
+        if self.selected_element.get("level") == 0:
+            row_counts = 2
+        self.properties_table.setRowCount(row_counts)
         row = 0
         for key, value in self.selected_element.items():
             if key == "level":
                 continue
+
+            if self.selected_element.get("level") == 0:
+                if key != "title" and key != "class_name":
+                    continue
 
             checkbox = QCheckBox()
             level = self.selected_element.get("level")
@@ -634,7 +650,6 @@ class SelectorExplorer(QMainWindow):
         QApplication.quit()
 
     def on_explorer(self):
-        self.hide()
         self.open_highlight_signal.emit()
 
     def on_click(self):
@@ -646,9 +661,7 @@ class SelectorExplorer(QMainWindow):
             result = find_element(final_selector)
             if result:
                 self.hide()
-                time.sleep(1)
                 find_element(final_selector).click_input()
-                time.sleep(1)
                 self.show()
             else:
                 QMessageBox.warning(self, "Warning", "Selector is not found")
