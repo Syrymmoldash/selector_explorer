@@ -1,10 +1,10 @@
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QCheckBox, QHeaderView, QLabel, QTextEdit, QAbstractItemView, QPushButton, QMessageBox
+    QVBoxLayout, QWidget, QHBoxLayout, QTableWidget, QTableWidgetItem, QComboBox,
+    QCheckBox, QHeaderView, QLabel, QTextEdit, QAbstractItemView, QPushButton, QMessageBox, QSizePolicy, QLineEdit
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QPainter, QPen, QIcon
+from PyQt6.QtGui import QFontMetrics, QPainter, QPen, QIcon, QFont
 import sys
 import time
 from pywinauto import uia_element_info
@@ -14,8 +14,8 @@ import json
 import os
 import win32process
 import win32gui
+import re
 import pyautogui
-import copy
 import keyboard
 import psutil
 
@@ -31,7 +31,7 @@ def find_element(selector):
     result = find_elements(selector)
     if result:
         return UIAWrapper(result[0])
-    return None
+    return False
 
 
 def find_matches(parent, selector, level=0):
@@ -40,12 +40,10 @@ def find_matches(parent, selector, level=0):
     matches = []
     expected_props = selector[level]
     if not hasattr(parent, "children"):
-        print(f"Skipping invalid parent at level {level}: {parent}")
         return []
     try:
         children = parent.children()
     except AttributeError:
-        print(f"Error: Parent at level {level} does not support 'children()': {parent}")
         return []
     if expected_props.get("ctrl_index"):
         try:
@@ -53,63 +51,37 @@ def find_matches(parent, selector, level=0):
             matches.extend(matched_descendants)
             return matches
         except Exception as e:
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
             return []
 
-    def selector_params(param: str, child):
-        if param == "class_name":
-            value = child.class_name
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "title":
-            value = child.name
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "control_type":
-            value = child.control_type
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "rich_text":
-            value = child.rich_text
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "visible":
-            value = child.visible
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "enabled":
-            value = child.enabled
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "control_id":
-            value = child.control_id
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "automation_id":
-            value = child.automation_id
-            if value == "" or value == 0 or value == {} or value == []:
-                value = None
-            return value
-        elif param == "rectangle":
-            value = {"left": child.rectangle.left, "right": child.rectangle.right, "top": child.rectangle.top, "bottom": child.rectangle.bottom}
-            if value == "" or value == "0" or value == {} or value == []:
-                value = None
-            return value
+    def selector_params(params: dict, child):
+        properties = {}
+        try:
+            properties = child.get_properties()
+            properties["title"] = child.element_info.name
+            properties.pop("rectangle")
+        except Exception as e:
+            properties = {
+                "class_name": child.element_info.class_name,
+                "title": child.element_info.name,
+                "control_type": child.element_info.control_type,
+                "rich_text": child.element_info.rich_text,
+                "visible": child.element_info.visible,
+                "enabled": child.element_info.enabled,
+                "control_id": child.element_info.control_id,
+                "automation_id": child.element_info.automation_id
+            }
+        for v in params:
+            if not properties.get(v):
+                continue
+            if params[v] != properties[v]:
+                return False
+        return True
+
 
     for child in children:
-        element_found = True
-        for key, _ in expected_props.items():
-            selector_key_value = expected_props.get(key)
-            if selector_key_value == "" or selector_key_value == 0 or selector_key_value == {} or selector_key_value == []:
-                selector_key_value = None
-            if selector_key_value != selector_params(key, child):
-                element_found = False
+        element_found = selector_params(expected_props, UIAWrapper(child))
         if element_found:
             matched_descendants = find_matches(child, selector, level + 1)
             matches.extend(matched_descendants)
@@ -118,11 +90,19 @@ def find_matches(parent, selector, level=0):
 
 def find_elements(selector):
     if not selector or not isinstance(selector[0], dict):
-        print("Invalid selector:", selector)
         return []
     desktop = UIAElementInfo()
-    search_args = {k: v for k, v in selector[0].items() if v and (k == "title" or k == "class_name")}
-    window = desktop.children(**search_args)
+    window_search_args_list = ["process", "class_name", "title", "control_type", "content_only", "title_re"]
+    window_search_args_dict = {}
+    for k, v in selector[0].items():
+        if k in window_search_args_list:
+            window_search_args_dict[k] = v
+    if window_search_args_dict.get("title_re"):
+        matching_windows = [child for child in desktop.children() if re.match(window_search_args_dict["title_re"], child.name)]
+        if matching_windows:
+            window_search_args_dict["title"] = matching_windows[0]
+            window_search_args_dict.pop("title_re")
+    window = desktop.children(**window_search_args_dict)
     if not window:
         return []
     matching_elements = []
@@ -139,39 +119,34 @@ def safe_compare(element1, element2):
     try:
         return bool(uia_element_info.IUIA().iuia.CompareElements(element1.element, element2.element))
     except Exception as e:
-        print(f"COMError in CompareElements: {e}")
         return False  # Handle invalid elements safely
 
 
-def wait_elements_to_appear(selectors_list: list[list], wait_time: int=30):
+def wait_element_to_appear(selector: list, wait_time: int=30):
     start_time = time.time()
-    found_list = []
-    for selector in selectors_list:
-        while True:
-            result = find_elements(selector)
-            if result:
-                found_list.append(True)
-                break
-            if time.time() - start_time > wait_time:
-                break
-    if len(found_list) == len(selectors_list) and False not in found_list:
+    result = None
+    while True:
+        result = find_elements(selector)
+        if result:
+            return True
+        if time.time() - start_time > wait_time:
+            break
+    if result:
         return True
     else:
         return False
 
 
-def wait_elements_to_disappear(selectors_list: list[list], wait_time: int=30):
+def wait_element_to_disappear(selector: list, wait_time: int=30):
     start_time = time.time()
-    found_list = []
-    for selector in selectors_list:
-        while True:
-            result = find_elements(selector)
-            if not result:
-                found_list.append(True)
-                break
-            if time.time() - start_time > wait_time:
-                break
-    if len(found_list) == len(selectors_list) and False not in found_list:
+    result = None
+    while True:
+        result = find_elements(selector)
+        if not result:
+            return True
+        if time.time() - start_time > wait_time:
+            break
+    if not result:
         return True
     else:
         return False
@@ -239,7 +214,6 @@ class HighlightWindow(QWidget):
 
         siblings = parent.children()  # Get all children (siblings)
 
-        # **Find the actual index of the element among siblings**
         try:
             return siblings.index(element)
         except ValueError:
@@ -248,22 +222,45 @@ class HighlightWindow(QWidget):
 
     def get_element_properties(self, element):
         """Extracts all available properties of a UIA element into a dictionary."""
-        properties = {
-            "class_name": element.class_name,
-            "title": element.name,
-            "control_type": element.control_type,
-            "rich_text": element.rich_text,
-            "visible": element.visible,
-            "enabled": element.enabled,
-            "control_id": element.control_id,
-            "automation_id": element.automation_id,
-            "rectangle": {
-                "left": element.rectangle.left,
-                "right": element.rectangle.right,
-                "top": element.rectangle.top,
-                "bottom": element.rectangle.bottom
-                }
+        properties = {}
+        try:
+            properties = UIAWrapper(element).get_properties()
+            properties["title"] = element.name
+            properties.pop("rectangle")
+        except Exception as e:
+            properties = {
+                "class_name": element.class_name,
+                "title": element.name,
+                "control_type": element.control_type,
+                "rich_text": element.rich_text,
+                "visible": element.visible,
+                "enabled": element.enabled,
+                "control_id": element.control_id,
+                "automation_id": element.automation_id,
+            }
+        properties["iface"] = {}
+        iface_mapping = {
+            "iface_value": lambda el: f"Current Value: {el.iface_value.CurrentValue}, Current Is Read Only: {el.iface_value.CurrentIsReadOnly}",
+            "iface_selection": lambda el: f"Current Selection: {[el.iface_selection.GetCurrentSelection().GetElement(i).CurrentName for i in range(el.iface_selection.GetCurrentSelection().Length)]}, Selection Is Required: {el.iface_selection.CurrentIsSelectionRequired}, Current Can Select Multiply: {el.iface_selection.CurrentCanSelectMultiple}",
+            "iface_toggle": lambda el: f"Toggle State: {el.iface_toggle.CurrentToggleState}",
+            "iface_scroll": lambda el: f"Current Horizontal Scroll Percent: {el.iface_scroll.CurrentHorizontalScrollPercent}, Current Vertical Scroll Percent: {el.iface_scroll.CurrentVerticalScrollPercent}, Current Horizontally Scrollable: {el.iface_scroll.CurrentHorizontallyScrollable}, Current Vertically Scrollable: {el.iface_scroll.CurrentVerticallyScrollable}, Current Horizontal View Size: {el.iface_scroll.CurrentHorizontalViewSize}, Current Vertical View Size: {el.iface_scroll.CurrentVerticalViewSize}",
+            "iface_invoke": lambda el: f"Clickable: Yes",
+            "iface_range_value": lambda el: f"Current Value: {el.iface_range_value.CurrentValue}, Current Is Read Only: {el.iface_range_value.CurrentIsReadOnly}, Current Maximum: {el.iface_range_value.CurrentMaximum}, Current Minimum: {el.iface_range_value.CurrentMinimum}, Current Large Change: {el.iface_range_value.CurrentLargeChange}, Current Small Change: {el.iface_range_value.CurrentSmallChange}",
+            "iface_text": lambda el: f"Current Text: {el.DocumentRange.GetText(-1)}",
+            "iface_grid": lambda el: f"Current Row Count: {el.iface_grid.CurrentRowCount}, Current Column Count: {el.iface_grid.CurrentColumnCount}",  # Grid dimensions
+            "iface_table": lambda el: f"Current Row Count: {el.iface_table.CurrentRowCount}, Current Column Count: {el.iface_table.CurrentColumnCount}, Current Row Or Column Major: {el.iface_table.CurrentRowOrColumnMajor}, Current Row Headers: {[el.iface_table.GetCurrentRowHeaders().GetElement(i).CurrentName for i in range(el.iface_table.GetCurrentRowHeaders().Length)]}, Current Column Headers: {[el.iface_table.GetCurrentColumnHeaders().GetElement(i).CurrentName for i in range(el.iface_table.GetCurrentColumnHeaders().Length)]}",  # Table headers
+            "iface_expand_collapse": lambda el: f"Expand Status: {el.iface_expand_collapse.CurrentExpandCollapseState}",
+            "iface_window": lambda el: f"Can be maximized: {el.iface_window.CurrentCanMaximize}, Can be minimized: {el.iface_window.CurrentCanMinimize}, Is Modal: {el.iface_window.CurrentIsModal}, Current Is Topmost: {el.iface_window.CurrentIsTopmost}, Current Window Visual State: {el.iface_window.CurrentWindowVisualState}, Current Window Interaction State: {el.iface_window.CurrentWindowInteractionState}",
+            "iface_transform": lambda el: f"Can Move: {el.iface_transform.CurrentCanMove}, Can Resize: {el.iface_transform.CurrentCanResize}, Can Rotate: {el.iface_transform.CurrentCanRotate}",  # Element bounding box
+            "iface_drag": lambda el: f"Is Grabbed: {el.iface_drag.CurrentIsGrabbed}, Drop Effect: {el.iface_drag.CurrentDropEffect}, Drop Effects: {el.iface_drag.CurrentDropEffects}",  # Dragging support
+            "iface_drop_target": lambda el: f"Drop Target Effect: {el.iface_drop_target.CurrentDropTargetEffect}, Drop Target Effect: {el.iface_drop_target.CurrentDropTargetEffects}",  # Dropping support
         }
+        for iface, func in iface_mapping.items():
+            try:
+                if hasattr(UIAWrapper(element), iface):
+                    properties["iface"][iface.replace("iface_", "").capitalize()] = func(UIAWrapper(element))
+            except:
+                pass
         return properties
 
 
@@ -331,7 +328,6 @@ class HighlightWindow(QWidget):
         try:
             element = self.get_filtered_element(x, y)  # Get element while ignoring the highlight window
         except Exception as e:
-            print(e)
             return
 
         if not element:
@@ -390,6 +386,129 @@ class SelectorExplorer(QMainWindow):
         self.selected_element = None
         self.checkboxes = {}
         self.selected_elements_data = []
+        self.result_return_actions_list = ["GetCellValue(row, column)"]
+        self.actions_dict = {
+            "Click": lambda arg: arg[0].click_input(),
+            "DoubleClick": lambda arg: arg[0].double_click_input(),
+            "Value": {
+                "SetValue(value)": lambda arg: arg[0].iface_value.SetValue(arg[1])
+            },
+            "Selection": {
+                "Select": lambda arg: arg[0].iface_selection_item.Select()
+            },
+            "Toggle": {
+                "Toggle": lambda arg: arg[0].iface_toggle.Toggle()
+            },
+            "Scroll": {
+                "ScrollByPercent(x, y)": lambda arg: arg[0].iface_scroll.SetScrollPercent(float(arg[1]), float(arg[2])),
+                "ScrollStep(x, y)": lambda arg: arg[0].iface_scroll.Scroll(int(arg[1]), int(arg[2]))
+            },
+            "Range_value": {
+                "SetValue(Value)": lambda arg: arg[0].iface_range_value.SetValue(float(arg[1]))
+            },
+            "Grid": {
+                "GetCellValue(row, column)": lambda arg: arg[0].iface_grid.GetItem(int(arg[1]), int(arg[2])).CurrentName
+            },
+            "Expand_collapse": {
+                "Expand": lambda arg: arg[0].iface_expand_collapse.Expand(),
+                "Collapse": lambda arg: arg[0].iface_expand_collapse.Collapse(),
+            },
+            "Window": {
+                "Close": lambda arg: arg[0].iface_window.Close(),
+                "WindowState(0-Normal, 1-Maximize, 2-Minimize)": lambda arg: arg[0].iface_window.SetWindowVisualState(int(arg[1]))
+            },
+            "Transform": {
+                "Move(x, y)": lambda arg: arg[0].iface_transform.Move(int(arg[1]), int(arg[2])),
+                "Resize(width, height)": lambda arg: arg[0].iface_transform.Resize(int(arg[1]), int(arg[2]))
+            }
+        }
+        self.current_actions = {}
+
+        self.setStyleSheet("""
+            /* General Styles */
+            QWidget {
+                background-color: #F9F9F9;  /* Clean white background */
+                color: #1A2038;  /* Dark blue-gray text */
+                font-family: "Segoe UI", Arial, sans-serif;
+                font-size: 14px;
+            }
+
+            /* Tree Widget, Table Widget, and Text Edit */
+            QTreeWidget, QTableWidget, QTextEdit {
+                background-color: #FFFFFF;  /* Pure white panels */
+                border: 1px solid #E0E0E0;  /* Soft gray borders */
+                border-radius: 8px;
+                padding: 6px;
+            }
+
+            /* Buttons */
+            QPushButton {
+                background-color: #1A2038;  /* Deep navy blue */
+                color: white;
+                border-radius: 8px;
+                padding: 12px;
+                font-size: 14px;
+                font-weight: bold;
+                border: none;
+            }
+
+            QPushButton:hover {
+                background-color: #232A48;  /* Slightly darker navy on hover */
+            }
+
+            QPushButton:pressed {
+                background-color: #0F1428;  /* Even darker on press */
+            }
+
+            /* Headers */
+            QHeaderView::section {
+                background-color: #E0E0E0;  /* Light gray headers */
+                color: #1A2038;
+                padding: 8px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+
+            /* Checkboxes */
+            QCheckBox {
+                spacing: 8px;
+            }
+
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                background-color: #E0E0E0;  /* Light gray */
+                border: 2px solid #1A2038;
+            }
+
+            QCheckBox::indicator:checked {
+                background-color: #1A2038;  /* Dark blue */
+                border: 2px solid white;
+            }
+
+            /* Scrollbars */
+            QScrollBar:vertical {
+                background: #F0F0F0;
+                width: 12px;
+                margin: 2px 0 2px 0;
+                border-radius: 6px;
+            }
+
+            QScrollBar::handle:vertical {
+                background: #C0C0C0;
+                border-radius: 6px;
+            }
+
+            QScrollBar::handle:vertical:hover {
+                background: #A0A0A0;
+            }
+
+            QScrollBar::sub-line:vertical, QScrollBar::add-line:vertical {
+                background: none;
+                border: none;
+            }
+        """)
 
         # Layouts
         central_widget = QWidget()
@@ -397,7 +516,15 @@ class SelectorExplorer(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
 
         top_layout = QHBoxLayout()
-        main_layout.addLayout(top_layout)
+        bottom_layout = QHBoxLayout()
+        left_bottom_layout = QVBoxLayout()
+        right_bottom_layout = QVBoxLayout()
+        bottom_layout.addLayout(left_bottom_layout)
+        bottom_layout.addLayout(right_bottom_layout)
+        bottom_layout.setStretchFactor(left_bottom_layout, 3)
+        bottom_layout.setStretchFactor(right_bottom_layout, 2)
+        main_layout.addLayout(top_layout, 5)
+        main_layout.addLayout(bottom_layout, 4)
 
         # Left Panel (Tree View) with Scrollbars
         self.tree = QTreeWidget()
@@ -406,19 +533,32 @@ class SelectorExplorer(QMainWindow):
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)  # Smooth scrolling
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)  # Allow user resizing
-        self.tree.setIndentation(20)  # Proper indentation for child elements
-        top_layout.addWidget(self.tree, 3)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)  # Allow user resizing
+        self.tree.setIndentation(10)  # Proper indentation for child elements
+        top_layout.addWidget(self.tree)
 
-        # Right Panel (Properties Table) with Scrollbars
+        # Mid Panel (Search Properties) with Scrollbars
         self.properties_table = QTableWidget()
         self.properties_table.setColumnCount(2)
-        self.properties_table.setHorizontalHeaderLabels(["", "Property"])
+        self.properties_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.properties_table.setHorizontalHeaderLabels(["", "Search Properties"])
         self.properties_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.properties_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.properties_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.properties_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.properties_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        top_layout.addWidget(self.properties_table, 3)
+        self.properties_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        top_layout.addWidget(self.properties_table)
+
+        # Right Panel (Legacy Properties) with Scrollbars
+        self.full_props_table = QTableWidget()
+        self.full_props_table.setColumnCount(1)
+        self.full_props_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.full_props_table.setHorizontalHeaderLabels(["Full Properties"])
+        self.full_props_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.full_props_table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.full_props_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.full_props_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        top_layout.addWidget(self.full_props_table)
 
         # Bottom Panel (Selector Display) with Scrollbars
         self.selector_display = QTextEdit()
@@ -426,34 +566,44 @@ class SelectorExplorer(QMainWindow):
         self.selector_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.selector_display.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.selector_display.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        main_layout.addWidget(QLabel("Generated Selector:"))
-        main_layout.addWidget(self.selector_display)
+        left_bottom_layout.addWidget(QLabel("Generated Selector:"))
+        left_bottom_layout.addWidget(self.selector_display)
 
-        button_layout = QHBoxLayout()
-        main_layout.addLayout(button_layout)
+        self.actions_label = QLabel("Actions list")
+        right_bottom_layout.addWidget(self.actions_label)
+        self.dropdown = QComboBox()
+        self.dropdown.addItems([])
+        self.dropdown.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_bottom_layout.addWidget(self.dropdown, 1)  # ✅ Dropdown at top-right of bottom panel
 
-        # Submit Button
-        self.submit_button = QPushButton("Submit")
-        self.submit_button.clicked.connect(self.on_submit)
-        button_layout.addWidget(self.submit_button)
+        self.arg_label = QLabel("Enter arguments(Separate by comma)")
+        right_bottom_layout.addWidget(self.arg_label)
+
+        self.arg_input = QTextEdit()
+        right_bottom_layout.addWidget(self.arg_input, 2)
+
+        # ✅ Button
+        self.action_button = QPushButton("Perform Action")
+        self.action_button.clicked.connect(self.on_perform)
+        self.action_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_bottom_layout.addWidget(self.action_button, 2)  # ✅ Button below dropdown
 
         # Cancel Button
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.on_cancel)
-        button_layout.addWidget(self.cancel_button)
+        self.cancel_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_bottom_layout.addWidget(self.cancel_button, 2)
 
         # Explore Button
         self.explore_button = QPushButton("Explore")
         self.explore_button.clicked.connect(self.on_explorer)
-        button_layout.addWidget(self.explore_button)
-
-        # Click on element Button
-        self.click_on_button = QPushButton("Click")
-        self.click_on_button.clicked.connect(self.on_click)
-        button_layout.addWidget(self.click_on_button)
+        self.explore_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        right_bottom_layout.addWidget(self.explore_button, 2)
 
         self.properties_table.clearContents()
         self.properties_table.setRowCount(0)
+        self.full_props_table.clearContents()
+        self.full_props_table.setRowCount(0)
 
         # Populate tree
         self.populate_tree()
@@ -462,6 +612,7 @@ class SelectorExplorer(QMainWindow):
         self.tree.clear()
         global selector
         item_map = {}  # Stores elements by their index for parent-child linking
+        max_width = 0
 
         for level, element in enumerate(selector):
             title = element.get('title', 'Unnamed')
@@ -476,6 +627,10 @@ class SelectorExplorer(QMainWindow):
                 tree_text += f", backend: {backend}"
             if ctrl_index is not None:
                 tree_text += f", ctrl_index: {ctrl_index}"
+
+            font_metrics = QFontMetrics(self.tree.font())
+            text_width = font_metrics.horizontalAdvance(tree_text) + font_metrics.horizontalAdvance(" ") * 25
+            max_width = max(max_width, text_width + level * 10)
 
             # Create a tree item
             item = QTreeWidgetItem([tree_text])
@@ -499,52 +654,21 @@ class SelectorExplorer(QMainWindow):
 
         # Expand all nodes initially
         self.tree.expandAll()
-        self.adjust_column_width()
+        self.adjust_column_width("tree", max_width)
 
-    def get_item_depth(self, item):
-        """Calculate depth (hierarchy level) of an item by counting its parents."""
-        depth = 0
-        while item.parent():
-            item = item.parent()
-            depth += 1
-        return depth
-
-
-    def adjust_column_width(self):
-        font_metrics = QFontMetrics(self.tree.font())
-
-        # Ensure there are items before computing width
-        tree_items = self.iterate_tree_items()
-
-        if not tree_items:  # Avoid max() on empty sequence
-            return
-
-        # Compute max width based on longest text + indentation level
-        max_width = max(
-            font_metrics.horizontalAdvance(item.text(0)) + (self.tree.indentation() * self.get_item_depth(item))
-            for item in tree_items
-        )
-
-        max_width  = max_width + int(max_width/10)
-
-        # 🔥 Set the new column width
-        self.tree.setColumnWidth(0, max_width)
-
-
-    def iterate_tree_items(self):
-        def get_all_items(parent):
-            for i in range(parent.childCount()):
-                child = parent.child(i)
-                yield child
-                yield from get_all_items(child)
-
-        return [self.tree.topLevelItem(i) for i in range(self.tree.topLevelItemCount())] + list(
-            get_all_items(self.tree.invisibleRootItem()))
+    def adjust_column_width(self, widget_type: str, max_width: int):
+        if widget_type == "tree":
+            self.tree.setColumnWidth(0, max_width)
+        elif widget_type == "table1":
+            self.properties_table.setColumnWidth(1, max_width)
+        elif widget_type == "table2":
+            self.full_props_table.setColumnWidth(0, max_width)
 
     def on_element_selected(self, item, column):
         self.selected_element = item.data(0, 1)
         if self.selected_element:
             self.update_properties_table()
+            self.update_full_props_table()
 
     def create_checkbox_callback(self, key):
         """Returns a proper callback function to prevent lambda closure issues."""
@@ -556,21 +680,23 @@ class SelectorExplorer(QMainWindow):
             return
 
         self.properties_table.clearContents()
-        row_counts = len(self.selected_element) - 1
+
+        levels_filter = []
         if self.selected_element.get("level") == 0:
-            row_counts = 2
-        self.properties_table.setRowCount(row_counts)
+            levels_filter = [key for key in self.selected_element if key in ["process", "class_name", "title", "control_type", "content_only"]]
+        else:
+            levels_filter = [key for key in self.selected_element if key in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id"]]
+        self.properties_table.setRowCount(len(levels_filter))
         row = 0
+        width_size = 0
         for key, value in self.selected_element.items():
-            if key == "level":
+            if key not in levels_filter:
                 continue
-
-            if self.selected_element.get("level") == 0:
-                if key != "title" and key != "class_name":
-                    continue
-
             checkbox = QCheckBox()
             level = self.selected_element.get("level")
+            font_metrics = QFontMetrics(self.properties_table.font())
+            text_width = font_metrics.horizontalAdvance(key + str(value)) + 10
+            width_size = max(width_size, text_width)
             if level is not None:
                 # Check if the key is in the checkboxes dictionary for this level
                 checked = key in self.checkboxes.get(level, [])
@@ -581,8 +707,44 @@ class SelectorExplorer(QMainWindow):
             self.properties_table.setCellWidget(row, 0, checkbox)
             self.properties_table.setItem(row, 1, QTableWidgetItem(f"{key}: {value}"))
             row += 1
-
+        self.adjust_column_width("table1", width_size)
         self.update_selector()
+
+    def update_full_props_table(self):
+        """Updates the properties table when an element is selected."""
+        if not self.selected_element:
+            return
+
+        self.full_props_table.clearContents()
+        row_counts = len(self.selected_element.get("iface"))
+        self.full_props_table.setRowCount(row_counts)
+        row = 0
+        width_size = 0
+        full_property_dict = self.selected_element.get("iface").copy()
+        for key, value in self.selected_element.items():
+            if key not in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id", "process", "content_only"]:
+                full_property_dict[key] = value
+        for key, value in full_property_dict.items():
+            font_metrics = QFontMetrics(self.properties_table.font())
+            text_width = font_metrics.horizontalAdvance(key + str(value)) + 10
+            width_size = max(width_size, text_width)
+            self.full_props_table.setItem(row, 0, QTableWidgetItem(f"{key}: {value}"))
+            row += 1
+        self.adjust_column_width("table2", width_size)
+        self.update_actions_list()
+        self.update_selector()
+
+    def update_actions_list(self):
+        self.dropdown.clear()
+        for key, value in self.actions_dict.items():
+            if self.selected_element["iface"].get(key):
+                for action_type, action_func in self.actions_dict[key].items():
+                    self.current_actions[action_type] = action_func
+                    self.dropdown.addItem(action_type)
+            else:
+                self.current_actions[key] = value
+        self.dropdown.addItem("Click")
+        self.dropdown.addItem("DoubleClick")
 
     def on_checkbox_state_changed(self, key, state):
         """Handles checkbox state changes and updates the checkboxes dictionary."""
@@ -626,24 +788,14 @@ class SelectorExplorer(QMainWindow):
             ]
 
             # Update the global selector
-            selector_ = copy.deepcopy(selector_text)
-            final_selector = selector_
+            final_selector = selector_text.copy()
 
             # Update the bottom panel
             self.selector_display.clear()
-            self.selector_display.setText(json.dumps(selector_, ensure_ascii=False, indent=4))
+            self.selector_display.setText(json.dumps(final_selector, ensure_ascii=False, indent=4))
         except ValueError:
             # Handle the case where self.selected_element is not in selector
-            print("Selected element not found in selector!")
-
-
-    def on_submit(self):
-        global final_selector
-        text = self.selector_display.toPlainText().strip()
-        if not text:
-            QMessageBox.warning(self, "Warning", "Selector is not chosen")
-        else:
-            QApplication.quit()
+            pass
 
     def on_cancel(self):
         selector = []
@@ -652,19 +804,32 @@ class SelectorExplorer(QMainWindow):
     def on_explorer(self):
         self.open_highlight_signal.emit()
 
-    def on_click(self):
+    def on_perform(self):
         global final_selector
-        text = self.selector_display.toPlainText().strip()
-        if not text:
+
+        selector_field = self.selector_display.toPlainText().strip()
+        if not selector_field:
             QMessageBox.warning(self, "Warning", "Selector is not chosen")
+            return
+        action = self.dropdown.currentText()
+        if not action:
+            QMessageBox.warning(self, "Warning", "Action is not chosen")
+            return
+        element = find_element(final_selector)
+        if not element:
+            QMessageBox.warning(self, "Warning", "Element is not found")
+            return
         else:
-            result = find_element(final_selector)
-            if result:
-                self.hide()
-                find_element(final_selector).click_input()
-                self.show()
-            else:
-                QMessageBox.warning(self, "Warning", "Selector is not found")
+            args = [element] + [arg for arg in str(self.arg_input.toPlainText().strip()).split(",") if len(arg) != 0]
+            self.hide()
+            try:
+                if action in self.result_return_actions_list:
+                    QMessageBox.warning(self, "Result", str(self.current_actions[action](args)))
+                else:
+                    self.current_actions[action](args)
+            except Exception as e:
+                QMessageBox.warning(self, "Warning", "Action failed")
+            self.show()
 
     def open_highlight_window(self):
         if not self.highlight_window:
@@ -683,12 +848,11 @@ class SelectorExplorer(QMainWindow):
 
 
 if __name__ == "__main__":
-    global final_selector
-    global selector
-    selector = []  # Ensure selector is a global list
+    final_selector = []
+    selector = []
     screen_width, screen_height = pyautogui.size()
-    app = QApplication(sys.argv)  # Create QApplication once
+    app = QApplication(sys.argv)
     app.setWindowIcon(QIcon(resource_path("pythonrpa_logo.ico")))
-    window = SelectorExplorer()  # Start with `SelectorExplorer`
+    window = SelectorExplorer()
     window.show()
-    app.exec()  # Start event loop
+    app.exec()
