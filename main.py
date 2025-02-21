@@ -685,7 +685,7 @@ class SelectorExplorer(QMainWindow):
         if self.selected_element.get("level") == 0:
             levels_filter = [key for key in self.selected_element if key in ["process", "class_name", "title", "control_type", "content_only"]]
         else:
-            levels_filter = [key for key in self.selected_element if key in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id"]]
+            levels_filter = [key for key in self.selected_element if key in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id", "ctrl_index"]]
         self.properties_table.setRowCount(len(levels_filter))
         row = 0
         width_size = 0
