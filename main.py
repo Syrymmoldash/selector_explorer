@@ -1,24 +1,44 @@
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget, QHBoxLayout, QTableWidget, QTableWidgetItem, QComboBox,
-    QCheckBox, QHeaderView, QLabel, QTextEdit, QAbstractItemView, QPushButton, QMessageBox, QSizePolicy, QLineEdit
+    QCheckBox, QHeaderView, QLabel, QTextEdit, QAbstractItemView, QPushButton, QMessageBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QFontMetrics, QPainter, QPen, QIcon, QFont
-import sys
+from PyQt6.QtGui import QFontMetrics, QPainter, QPen, QIcon
 import time
 from pywinauto import uia_element_info
-from pywinauto.uia_element_info import UIAElementInfo
-from pywinauto.controls.uiawrapper import UIAWrapper
+from pywinauto.application import WindowSpecification
 import json
+import threading
 import os
 import win32process
 import win32gui
-import re
+import pywinauto
 import pyautogui
 import keyboard
-import psutil
+import sys
 
+
+CONTROL_TYPE_MAPPING = {
+    'Dialog': 'Window',
+    'Dlg': 'Window',
+    'Textbox': 'Edit',
+    'Listview': 'List',
+    'Listitem': 'ListItem',
+    'Radio': 'RadioButton',
+    'Dropdown': 'ComboBox',
+    'Treeview': 'Tree',
+    'Label': 'Text',
+    'Panel': 'Pane'
+}
+
+
+def main_process():
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(resource_path("pythonrpa_logo.ico")))
+    window = SelectorExplorer()
+    window.show()
+    app.exec()
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for PyInstaller bundle """
@@ -28,9 +48,9 @@ def resource_path(relative_path):
 
 
 def find_element(selector):
-    result = find_elements(selector)
-    if result:
-        return UIAWrapper(result[0])
+    results = find_elements(selector)
+    if results:
+        return results[0]
     return False
 
 
@@ -45,43 +65,25 @@ def find_matches(parent, selector, level=0):
         children = parent.children()
     except AttributeError:
         return []
-    if expected_props.get("ctrl_index"):
-        try:
-            matched_descendants = find_matches(children[expected_props.get("ctrl_index")], selector, level + 1)
-            matches.extend(matched_descendants)
-            return matches
-        except Exception as e:
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            return []
 
     def selector_params(params: dict, child):
-        properties = {}
-        try:
-            properties = child.get_properties()
-            properties["title"] = child.element_info.name
-            properties.pop("rectangle")
-        except Exception as e:
-            properties = {
-                "class_name": child.element_info.class_name,
-                "title": child.element_info.name,
-                "control_type": child.element_info.control_type,
-                "rich_text": child.element_info.rich_text,
-                "visible": child.element_info.visible,
-                "enabled": child.element_info.enabled,
-                "control_id": child.element_info.control_id,
-                "automation_id": child.element_info.automation_id
-            }
+        props = {
+            "title": child.window_text(),
+            "class_name": child.class_name(),
+            "control_type": child.friendly_class_name(),
+            "control_id": child.control_id(),
+            "ctrl_index": child.parent().children().index(child)
+        }
+        if CONTROL_TYPE_MAPPING.get(props["control_type"]):
+            props["control_type"] = CONTROL_TYPE_MAPPING.get(props["control_type"])
         for v in params:
-            if not properties.get(v):
-                continue
-            if params[v] != properties[v]:
+            if params[v] != props[v]:
                 return False
         return True
 
 
     for child in children:
-        element_found = selector_params(expected_props, UIAWrapper(child))
+        element_found = selector_params(expected_props, child)
         if element_found:
             matched_descendants = find_matches(child, selector, level + 1)
             matches.extend(matched_descendants)
@@ -91,23 +93,13 @@ def find_matches(parent, selector, level=0):
 def find_elements(selector):
     if not selector or not isinstance(selector[0], dict):
         return []
-    desktop = UIAElementInfo()
-    window_search_args_list = ["process", "class_name", "title", "control_type", "content_only", "title_re"]
-    window_search_args_dict = {}
-    for k, v in selector[0].items():
-        if k in window_search_args_list:
-            window_search_args_dict[k] = v
-    if window_search_args_dict.get("title_re"):
-        matching_windows = [child for child in desktop.children() if re.match(window_search_args_dict["title_re"], child.name)]
-        if matching_windows:
-            window_search_args_dict["title"] = matching_windows[0]
-            window_search_args_dict.pop("title_re")
-    window = desktop.children(**window_search_args_dict)
-    if not window:
+    window = pywinauto.Desktop("uia").window(**selector[0])
+    if not window.exists():
         return []
     matching_elements = []
+
     try:
-        matching_elements.extend(find_matches(window[0], selector[1:]))
+        matching_elements.extend(find_matches(window, selector[1:]))
     except Exception as e:
         return []
     return matching_elements
@@ -159,27 +151,15 @@ class HighlightWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
                             Qt.WindowType.Tool | Qt.WindowType.BypassWindowManagerHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # Transparent background
-
-        self.highlight_pid = self.get_window_pid()  # Get PID once at startup
-        self.backend = "uia"  # Set the backend used
-
+        self.highlight_pid = self.get_window_pid()
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_highlight)
         self.timer.start(100)  # Slightly slower refresh to prevent overload
 
         self.rect_x, self.rect_y, self.rect_w, self.rect_h = 0, 0, 0, 0  # Default rectangle
         self.last_element = None  # Store last highlighted element
-
-    def get_process_name(self, process_id):
-        """Returns the process name given its ID."""
-        try:
-            return psutil.Process(process_id).name()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            return None  # Return None if process is unavailable
-
-    def get_foreground_window(self):
-        hwnd = win32gui.GetForegroundWindow()
-        return win32gui.GetWindowText(hwnd)
+        self.element = None
+        self.deepest_element = None
 
     def get_window_pid(self):
         """Finds and stores the PID of the highlight window."""
@@ -187,58 +167,52 @@ class HighlightWindow(QWidget):
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         return pid  # Return the PID for filtering
 
-    def get_application_window(self, element):
-        """Finds the top-most window belonging to the same process."""
-        while element.parent and element.parent.process_id == element.process_id:
-            element = element.parent  # Move up to the main application window
-        return element  # Return the application-level window
+    def get_foreground_window(self):
+        hwnd = win32gui.GetForegroundWindow()
+        return win32gui.GetWindowText(hwnd)
 
-    def get_filtered_element(self, x, y):
+    def get_element(self, x, y):
         """Finds the first valid UI element that is NOT from the ignored process."""
-        element = UIAElementInfo.from_point(x, y)
-
-        # **Filter out elements from the highlight window itself**
-        while element and element.process_id == self.highlight_pid:
-            element = element.parent  # Move up the UI tree to find a valid element
+        element = pywinauto.Desktop(backend="uia").from_point(x, y)
+        while element and element.element_info.process_id == self.highlight_pid:
+            element = element.parent()  # Move up the UI tree to find a valid element
         foreground_title = self.get_foreground_window()
-        top_window = self.get_application_window(element)
-        if top_window.name != foreground_title:
+        if element.top_level_parent().element_info.name != foreground_title:
             return None
         return element
 
-    def get_ctrl_index(self, element):
-        """Finds the index of an element among all its siblings."""
-        parent = element.parent  # Get the parent element
-        if not parent:
-            return None  # No parent means it's a top-level window
-
-        siblings = parent.children()  # Get all children (siblings)
-
-        try:
-            return siblings.index(element)
-        except ValueError:
-            return None  # If element is not found for some reason
-
-
-    def get_element_properties(self, element):
-        """Extracts all available properties of a UIA element into a dictionary."""
-        properties = {}
-        try:
-            properties = UIAWrapper(element).get_properties()
-            properties["title"] = element.name
-            properties.pop("rectangle")
-        except Exception as e:
-            properties = {
-                "class_name": element.class_name,
-                "title": element.name,
-                "control_type": element.control_type,
-                "rich_text": element.rich_text,
-                "visible": element.visible,
-                "enabled": element.enabled,
-                "control_id": element.control_id,
-                "automation_id": element.automation_id,
+    def get_selector(self, element):
+        selector = []
+        while element != element.top_level_parent():
+            props = {
+                "title": element.window_text(),
+                "class_name": element.class_name(),
+                "control_type": element.friendly_class_name(),
+                "control_id": element.control_id(),
+                "ctrl_index": element.parent().children().index(element),
+                "iface": self.get_elements_functions(element)
             }
-        properties["iface"] = {}
+            selector.append(props)
+            element = element.parent()
+        props = {
+            "title": element.window_text(),
+            "class_name": element.class_name(),
+            "control_type": element.friendly_class_name(),
+            "control_id": element.control_id(),
+            "iface": self.get_elements_functions(element)
+        }
+        selector.append(props)
+        level = 0
+        selector = selector[::-1]
+        for elm_dict in selector:
+            if CONTROL_TYPE_MAPPING.get(elm_dict["control_type"]):
+                elm_dict["control_type"] = CONTROL_TYPE_MAPPING[elm_dict["control_type"]]
+            elm_dict["level"] = level
+            level = level + 1
+        return selector
+
+    def get_elements_functions(self, element):
+        element_funcs = {}
         iface_mapping = {
             "iface_value": lambda el: f"Current Value: {el.iface_value.CurrentValue}, Current Is Read Only: {el.iface_value.CurrentIsReadOnly}",
             "iface_selection": lambda el: f"Current Selection: {[el.iface_selection.GetCurrentSelection().GetElement(i).CurrentName for i in range(el.iface_selection.GetCurrentSelection().Length)]}, Selection Is Required: {el.iface_selection.CurrentIsSelectionRequired}, Current Can Select Multiply: {el.iface_selection.CurrentCanSelectMultiple}",
@@ -257,35 +231,11 @@ class HighlightWindow(QWidget):
         }
         for iface, func in iface_mapping.items():
             try:
-                if hasattr(UIAWrapper(element), iface):
-                    properties["iface"][iface.replace("iface_", "").capitalize()] = func(UIAWrapper(element))
+                if hasattr(element, iface):
+                    element_funcs[iface.replace("iface_", "").capitalize()] = func(element)
             except:
                 pass
-        return properties
-
-
-    def get_ancestor_properties(self, element):
-        """Collects properties of the element and all its parents up to the application level."""
-        ancestors = []
-        application_element = self.get_application_window(element)  # Find the application-level element
-
-        while element and element != application_element:
-            props = self.get_element_properties(element)
-
-            # **For all child elements, add ctrl_index**
-            ctrl_index = self.get_ctrl_index(element)
-            if ctrl_index is not None:
-                props["ctrl_index"] = ctrl_index
-
-            ancestors.append(props)
-            element = element.parent  # Move to the parent
-
-        # **Set backend only on the application level (top-most application element)**
-        app_props = self.get_element_properties(application_element)
-        app_props["backend"] = self.backend
-        ancestors.append(app_props)  # Add application level as the last element
-
-        return ancestors[::-1]  # Reverse order (application-level first)
+        return element_funcs
 
     def get_deepest_element(self, element, x, y, max_depth=10):
         """Finds the smallest child element under the cursor, preventing infinite recursion."""
@@ -300,7 +250,7 @@ class HighlightWindow(QWidget):
             children = current_element.children()
 
             # **Skip elements from the highlight window**
-            if current_element.process_id == self.highlight_pid:
+            if current_element.element_info.process_id == self.highlight_pid:
                 continue  # Ignore this element and move to the next one
 
             # **If no children, return the current valid element**
@@ -309,7 +259,7 @@ class HighlightWindow(QWidget):
 
             # **Check deeper elements**
             for child in children:
-                rect = child.rectangle
+                rect = child.element_info.rectangle
                 if rect.left <= x <= rect.right and rect.top <= y <= rect.bottom:
                     stack.append((child, depth + 1))
                     last_valid_element = child  # Store last valid element
@@ -318,6 +268,7 @@ class HighlightWindow(QWidget):
 
     def update_highlight(self):
         global selector
+        selector.clear()
         if keyboard.is_pressed("esc"):
             self.finished.emit([])
             self.close()
@@ -326,25 +277,25 @@ class HighlightWindow(QWidget):
         """Detects the topmost hovered element and updates the highlight position."""
         x, y = pyautogui.position()
         try:
-            element = self.get_filtered_element(x, y)  # Get element while ignoring the highlight window
+            self.element = self.get_element(x, y)
         except Exception as e:
             return
 
-        if not element:
+        if not self.element:
             self.hide()
             return
 
         # **Find the absolute deepest child under the cursor**
-        deepest_element = self.get_deepest_element(element, x, y)
-        rect = deepest_element.rectangle
+        self.deepest_element = self.get_deepest_element(self.element, x, y)
 
         # **Check if Ctrl is pressed and return ancestor properties**
         if keyboard.is_pressed("ctrl"):
-            selector.clear()
-            selector.extend(self.get_ancestor_properties(deepest_element))
+            selector = self.get_selector(self.deepest_element)
             self.finished.emit(selector)
-            self.close()
+            self.timer.stop()
+            self.hide()
 
+        rect = self.deepest_element.element_info.rectangle
         # **Force update even if the new element is inside the previous one**
         if rect and rect.right > rect.left and rect.bottom > rect.top:
             new_rect = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
@@ -355,10 +306,10 @@ class HighlightWindow(QWidget):
                 return
 
             # **Ensure update if switching elements inside the same area**
-            if not safe_compare(deepest_element, self.last_element):
+            if not safe_compare(self.deepest_element, self.last_element):
                 self.rect_x, self.rect_y, self.rect_w, self.rect_h = new_rect
                 self.setGeometry(self.rect_x, self.rect_y, self.rect_w, self.rect_h)
-                self.last_element = deepest_element  # Save the last element
+                self.last_element = self.deepest_element  # Save the last element
                 self.show()
                 self.update()  # Force repaint
 
@@ -373,10 +324,10 @@ class HighlightWindow(QWidget):
 
 
 class SelectorExplorer(QMainWindow):
+    global selector
     open_highlight_signal = pyqtSignal()
     def __init__(self):
         super().__init__()
-        global selector
         self.setWindowTitle("Selector Explorer")
         self.setGeometry(100, 100, 1000, 600)
         self.setWindowIcon(QIcon(resource_path("pythonrpa_logo.ico")))
@@ -385,7 +336,7 @@ class SelectorExplorer(QMainWindow):
 
         self.selected_element = None
         self.checkboxes = {}
-        self.selected_elements_data = []
+        self.current_actions = {}
         self.result_return_actions_list = ["GetCellValue(row, column)"]
         self.actions_dict = {
             "Click": lambda arg: arg[0].click_input(),
@@ -422,7 +373,6 @@ class SelectorExplorer(QMainWindow):
                 "Resize(width, height)": lambda arg: arg[0].iface_transform.Resize(int(arg[1]), int(arg[2]))
             }
         }
-        self.current_actions = {}
 
         self.setStyleSheet("""
             /* General Styles */
@@ -518,6 +468,7 @@ class SelectorExplorer(QMainWindow):
         top_layout = QHBoxLayout()
         bottom_layout = QHBoxLayout()
         left_bottom_layout = QVBoxLayout()
+        left_bottom_labels_layout = QHBoxLayout()
         right_bottom_layout = QVBoxLayout()
         bottom_layout.addLayout(left_bottom_layout)
         bottom_layout.addLayout(right_bottom_layout)
@@ -566,8 +517,15 @@ class SelectorExplorer(QMainWindow):
         self.selector_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.selector_display.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         self.selector_display.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        left_bottom_layout.addWidget(QLabel("Generated Selector:"))
-        left_bottom_layout.addWidget(self.selector_display)
+
+        left_bottom_labels_layout.addWidget(QLabel("Generated Selector:"), 1)
+        # ✅ Button
+        self.copy_button = QPushButton("Copy")
+        self.copy_button.clicked.connect(self.copy_selector_to_clipboard)
+        self.copy_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        left_bottom_labels_layout.addWidget(self.copy_button, 1)
+        left_bottom_layout.addLayout(left_bottom_labels_layout, 1)
+        left_bottom_layout.addWidget(self.selector_display, 8)
 
         self.actions_label = QLabel("Actions list")
         right_bottom_layout.addWidget(self.actions_label)
@@ -609,25 +567,13 @@ class SelectorExplorer(QMainWindow):
         self.populate_tree()
 
     def populate_tree(self):
-        self.tree.clear()
         global selector
-        item_map = {}  # Stores elements by their index for parent-child linking
+        self.tree.clear()
+        item_map = {}
         max_width = 0
 
         for level, element in enumerate(selector):
-            title = element.get('title', 'Unnamed')
-            class_name = element.get('class_name', '')
-            ctrl_index = element.get('ctrl_index', None)
-            backend = element.get('backend', '')
-            element["level"] = level
-
-            # Format tree display
-            tree_text = f"Level {level}, Title: {title}, class_name: {class_name}"
-            if backend:
-                tree_text += f", backend: {backend}"
-            if ctrl_index is not None:
-                tree_text += f", ctrl_index: {ctrl_index}"
-
+            tree_text = f"Level {element.get("level")}, Title: {element.get("title")}, class_name: {element.get("class_name")}"
             font_metrics = QFontMetrics(self.tree.font())
             text_width = font_metrics.horizontalAdvance(tree_text) + font_metrics.horizontalAdvance(" ") * 25
             max_width = max(max_width, text_width + level * 10)
@@ -647,10 +593,7 @@ class SelectorExplorer(QMainWindow):
 
             # Store the item in the map
             item_map[level] = item
-            if level == 0:
-                self.checkboxes[level] = ["title", "backend", "class_name"]
-            else:
-                self.checkboxes[level] = ["title", "ctrl_index", "class_name"]
+            self.checkboxes[level] = ["title", "class_name", "control_type"]
 
         # Expand all nodes initially
         self.tree.expandAll()
@@ -664,7 +607,7 @@ class SelectorExplorer(QMainWindow):
         elif widget_type == "table2":
             self.full_props_table.setColumnWidth(0, max_width)
 
-    def on_element_selected(self, item, column):
+    def on_element_selected(self, item):
         self.selected_element = item.data(0, 1)
         if self.selected_element:
             self.update_properties_table()
@@ -681,11 +624,7 @@ class SelectorExplorer(QMainWindow):
 
         self.properties_table.clearContents()
 
-        levels_filter = []
-        if self.selected_element.get("level") == 0:
-            levels_filter = [key for key in self.selected_element if key in ["process", "class_name", "title", "control_type", "content_only"]]
-        else:
-            levels_filter = [key for key in self.selected_element if key in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id", "ctrl_index"]]
+        levels_filter = [key for key in self.selected_element if key not in ["level", "iface"]]
         self.properties_table.setRowCount(len(levels_filter))
         row = 0
         width_size = 0
@@ -721,23 +660,20 @@ class SelectorExplorer(QMainWindow):
         row = 0
         width_size = 0
         full_property_dict = self.selected_element.get("iface").copy()
-        for key, value in self.selected_element.items():
-            if key not in ["class_name", "title", "control_type", "rich_text", "visible", "enabled", "control_id", "automation_id", "process", "content_only"]:
-                full_property_dict[key] = value
         for key, value in full_property_dict.items():
-            font_metrics = QFontMetrics(self.properties_table.font())
+            font_metrics = QFontMetrics(self.full_props_table.font())
             text_width = font_metrics.horizontalAdvance(key + str(value)) + 10
             width_size = max(width_size, text_width)
             self.full_props_table.setItem(row, 0, QTableWidgetItem(f"{key}: {value}"))
             row += 1
         self.adjust_column_width("table2", width_size)
-        self.update_actions_list()
+        self.update_actions_list(full_property_dict)
         self.update_selector()
 
-    def update_actions_list(self):
+    def update_actions_list(self, full_property_dict):
         self.dropdown.clear()
         for key, value in self.actions_dict.items():
-            if self.selected_element["iface"].get(key):
+            if full_property_dict.get(key):
                 for action_type, action_func in self.actions_dict[key].items():
                     self.current_actions[action_type] = action_func
                     self.dropdown.addItem(action_type)
@@ -752,8 +688,6 @@ class SelectorExplorer(QMainWindow):
             return
 
         level = self.selected_element.get("level")
-        if level is None:
-            return
 
         # Get the current keys for this level or an empty list if not found
         current_keys = self.checkboxes.get(level, [])
@@ -772,41 +706,37 @@ class SelectorExplorer(QMainWindow):
 
     def update_selector(self):
         """Updates the bottom panel with the current selector."""
-        global selector, final_selector
+        global selector, find_selector
         if not self.selected_element:
             return
 
-        try:
-            # Find the index of the selected element in the global selector
-            index = selector.index(self.selected_element)
-            selected_subset = selector[: index + 1]
+        # Find the index of the selected element in the global selector
+        index = selector.index(self.selected_element)
+        selected_subset = selector[: index + 1]
+        # Filter the elements based on the checkboxes dictionary
+        selector_text = [
+            {k: v for k, v in element.items() if k in self.checkboxes.get(element.get("level"), [])}
+            for element in selected_subset
+        ]
 
-            # Filter the elements based on the checkboxes dictionary
-            selector_text = [
-                {k: v for k, v in element.items() if k in self.checkboxes.get(element.get("level"), [])}
-                for element in selected_subset
-            ]
+        # Update the global selector
+        find_selector = selector_text.copy()
 
-            # Update the global selector
-            final_selector = selector_text.copy()
-
-            # Update the bottom panel
-            self.selector_display.clear()
-            self.selector_display.setText(json.dumps(final_selector, ensure_ascii=False, indent=4))
-        except ValueError:
-            # Handle the case where self.selected_element is not in selector
-            pass
+        # Update the bottom panel
+        self.selector_display.clear()
+        self.selector_display.setText(json.dumps(find_selector, ensure_ascii=False, indent=4))
 
     def on_cancel(self):
-        selector = []
+        global selector
+        selector.clear()
         QApplication.quit()
 
     def on_explorer(self):
+        self.hide()
         self.open_highlight_signal.emit()
 
     def on_perform(self):
-        global final_selector
-
+        global find_selector
         selector_field = self.selector_display.toPlainText().strip()
         if not selector_field:
             QMessageBox.warning(self, "Warning", "Selector is not chosen")
@@ -815,7 +745,9 @@ class SelectorExplorer(QMainWindow):
         if not action:
             QMessageBox.warning(self, "Warning", "Action is not chosen")
             return
-        element = find_element(final_selector)
+        element = find_element(find_selector)
+        if type(element) == WindowSpecification:
+            element = element.wrapper_object()
         if not element:
             QMessageBox.warning(self, "Warning", "Element is not found")
             return
@@ -832,10 +764,15 @@ class SelectorExplorer(QMainWindow):
             self.show()
 
     def open_highlight_window(self):
-        if not self.highlight_window:
+        if not self.highlight_window or self.highlight_window.isHidden():
             self.highlight_window = HighlightWindow()
             self.highlight_window.finished.connect(self.on_highlight_finished)
         self.highlight_window.show()
+
+    def copy_selector_to_clipboard(self):
+        text = self.selector_display.toPlainText().strip()
+        if text:
+            QTimer.singleShot(0, lambda: QApplication.clipboard().setText(text))
 
     def on_highlight_finished(self, selector_elements):
         global selector
@@ -845,14 +782,13 @@ class SelectorExplorer(QMainWindow):
         self.properties_table.clearContents()
         self.properties_table.setRowCount(0)
         self.populate_tree()
+        self.highlight_window = None
 
 
 if __name__ == "__main__":
-    final_selector = []
     selector = []
+    find_selector = []
     screen_width, screen_height = pyautogui.size()
-    app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(resource_path("pythonrpa_logo.ico")))
-    window = SelectorExplorer()
-    window.show()
-    app.exec()
+    qt_thread = threading.Thread(target=main_process, daemon=True)
+    qt_thread.start()
+    qt_thread.join()
