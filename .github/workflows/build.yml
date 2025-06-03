@@ -29,7 +29,7 @@ jobs:
           pyinstaller --name selector_explorer --noconsole --onefile --icon=pythonrpa_logo.ico --add-data "pythonrpa_logo.ico;." main.py
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: selector_explorer
           path: dist/selector_explorer*
