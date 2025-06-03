@@ -33,3 +33,9 @@ jobs:
         with:
           name: selector_explorer
           path: dist/selector_explorer*
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.sha }}
+          artifacts: "dist/selector_explorer*"
