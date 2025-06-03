@@ -2,3 +2,6 @@ venv/
 build/
 dist/
 selector_explorer.spec
+.pytest_cache/
+__pycache__/
+.idea/

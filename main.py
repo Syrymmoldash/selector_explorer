@@ -123,6 +123,7 @@ def wait_element_to_appear(selector: list, wait_time: int=30):
             return True
         if time.time() - start_time > wait_time:
             break
+        time.sleep(0.1)
     if result:
         return True
     else:
@@ -138,6 +139,7 @@ def wait_element_to_disappear(selector: list, wait_time: int=30):
             return True
         if time.time() - start_time > wait_time:
             break
+        time.sleep(0.1)
     if not result:
         return True
     else:
