@@ -573,7 +573,10 @@ class SelectorExplorer(QMainWindow):
         max_width = 0
 
         for level, element in enumerate(selector):
-            tree_text = f"Level {element.get("level")}, Title: {element.get("title")}, class_name: {element.get("class_name")}"
+            tree_text = (
+                f"Level {element.get('level')}, Title: {element.get('title')}, "
+                f"class_name: {element.get('class_name')}"
+            )
             font_metrics = QFontMetrics(self.tree.font())
             text_width = font_metrics.horizontalAdvance(tree_text) + font_metrics.horizontalAdvance(" ") * 25
             max_width = max(max_width, text_width + level * 10)
