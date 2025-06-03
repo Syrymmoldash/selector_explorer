@@ -6,6 +6,6 @@ def test_readme_exists():
 
 
 def test_requirements_has_pywin32():
-    with open('requirements.txt', 'r', encoding='utf-16') as f:
+    with open('requirements.txt', 'r', encoding='utf-8') as f:
         data = f.read()
     assert 'pywin32' in data
