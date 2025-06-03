@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -29,7 +29,13 @@ jobs:
           pyinstaller --name selector_explorer --noconsole --onefile --icon=pythonrpa_logo.ico --add-data "pythonrpa_logo.ico;." main.py
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: selector_explorer
           path: dist/selector_explorer*
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.sha }}
+          artifacts: "dist/selector_explorer*"
